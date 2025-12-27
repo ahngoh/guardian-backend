@@ -73,13 +73,13 @@ def analyze_screen():
             ]
         )
 
-        # extract assistant text
-        for item in response.output:
-            for part in item.get("content", []):
-                if part.get("type") == "output_text":
-                    return jsonify({"reply": part.get("text")})
+        # ✅ CORRECT extraction for Responses API
+        reply = response.output_text
 
-        return jsonify({"error": "No assistant text returned"}), 500
+        if not reply:
+            return jsonify({"error": "Empty response from OpenAI"}), 500
+
+        return jsonify({"reply": reply})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
