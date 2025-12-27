@@ -41,6 +41,50 @@ def chat():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+# ---------------- SCREEN ANALYSIS ENDPOINT ----------------
+@app.route("/analyze_screen", methods=["POST"])
+def analyze_screen():
+    data = request.get_json(force=True)
+
+    prompt = data.get("prompt")
+    image_b64 = data.get("image")
+
+    if not prompt:
+        return jsonify({"error": "No prompt provided"}), 400
+
+    if not image_b64:
+        return jsonify({"error": "No image provided"}), 400
+
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/jpeg;base64,{image_b64}"
+                        }
+                    ]
+                }
+            ]
+        )
+
+        # extract assistant text
+        for item in response.output:
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    return jsonify({"reply": part.get("text")})
+
+        return jsonify({"error": "No assistant text returned"}), 500
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ---------------- RUN SERVER ----------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
