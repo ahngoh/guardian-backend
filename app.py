@@ -3,6 +3,7 @@ from flask_cors import CORS
 import os
 import time
 from openai import OpenAI
+raise RuntimeError("ACTIVE BACKEND")
 
 # ---------------- APP SETUP ----------------
 app = Flask(__name__)
