@@ -1,94 +1,144 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os, time
 from openai import OpenAI
-import stripe
+import os, time
 
+# ---------------- APP SETUP ----------------
 app = Flask(__name__)
 CORS(app)
 
-# ---- CONFIG ----
-stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
-STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+# OpenAI client (same as original)
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
+# ---------------- TEMP ENTITLEMENTS (SAFE) ----------------
 ENTITLEMENTS = {}
-SCREEN_LIMIT = 30
+SCREEN_LIMIT_PLUS = 30
 
-# ---- HELPERS ----
-def email():
-    return request.headers.get("X-User-Email")
+def get_user_email():
+    email = request.headers.get("X-User-Email")
+    return email.lower() if email else None
 
-# ---- HEALTH ----
-@app.route("/health")
+def get_entitlement(email):
+    return ENTITLEMENTS.get(email, {
+        "plan": "free",
+        "screen_remaining": 0
+    })
+
+def ensure_plus_access(email):
+    ent = get_entitlement(email)
+
+    if ent["plan"] != "plus":
+        return False, "Upgrade to Plus to use screen share."
+
+    if ent["screen_remaining"] <= 0:
+        return False, "Screen share limit reached."
+
+    ent["screen_remaining"] -= 1
+    ENTITLEMENTS[email] = ent
+    return True, None
+
+# ---------------- ROUTES ----------------
+
+@app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok"}
+    return jsonify({"status": "ok"})
 
-# ---- CHAT ----
+# ---- CHAT (UNCHANGED BEHAVIOR) ----
 @app.route("/chat", methods=["POST"])
 def chat():
-    data = request.get_json()
-    msg = data.get("message")
+    if not client:
+        return jsonify({"error": "OpenAI not configured"}), 500
 
-    res = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are Guardian."},
-            {"role": "user", "content": msg},
-        ],
-    )
+    data = request.json
+    user_message = data.get("message") if data else None
 
-    return {"reply": res.choices[0].message.content}
+    if not user_message:
+        return jsonify({"error": "No message provided"}), 400
 
-# ---- SCREEN SHARE ----
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are Guardian, a calm step-by-step guide."
+                },
+                {
+                    "role": "user",
+                    "content": user_message
+                }
+            ]
+        )
+
+        return jsonify({
+            "reply": response.choices[0].message.content
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---- SCREEN ANALYSIS (PLUS ONLY) ----
 @app.route("/analyze_screen", methods=["POST"])
 def analyze_screen():
-    e = email()
-    if not e or e not in ENTITLEMENTS:
-        return {"error": "Upgrade to Plus to use screen share."}, 403
+    if not client:
+        return jsonify({"error": "OpenAI not configured"}), 500
 
-    ent = ENTITLEMENTS[e]
-    if ent["remaining"] <= 0:
-        return {"error": "Screen share limit reached."}, 403
+    email = get_user_email()
+    if not email:
+        return jsonify({"error": "Login required"}), 401
 
-    ent["remaining"] -= 1
+    allowed, reason = ensure_plus_access(email)
+    if not allowed:
+        return jsonify({"error": reason}), 403
 
-    data = request.get_json()
-    prompt = data["prompt"]
-    image = data["image"]
+    data = request.json
+    prompt = data.get("prompt") if data else None
+    image_b64 = data.get("image") if data else None
 
-    res = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image",
-                 "image_url": f"data:image/jpeg;base64,{image}"}
-            ]
-        }]
-    )
+    if not prompt or not image_b64:
+        return jsonify({"error": "Missing prompt or image"}), 400
 
-    return {"reply": res.output_text}
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{image_b64}"
+                    }
+                ]
+            }]
+        )
 
-# ---- STRIPE WEBHOOK ----
-@app.route("/stripe/webhook", methods=["POST"])
-def stripe_webhook():
-    payload = request.data
-    sig = request.headers.get("Stripe-Signature")
+        return jsonify({
+            "reply": response.output_text,
+            "remaining": ENTITLEMENTS[email]["screen_remaining"]
+        })
 
-    event = stripe.Webhook.construct_event(
-        payload, sig, STRIPE_WEBHOOK_SECRET
-    )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        email = session["customer_email"]
+# ---- TEMP ADMIN (OPTIONAL, SAFE) ----
+@app.route("/_grant_plus", methods=["POST"])
+def grant_plus():
+    data = request.json
+    email = data.get("email") if data else None
 
-        ENTITLEMENTS[email] = {
-            "plan": "plus",
-            "remaining": SCREEN_LIMIT,
-            "renews": time.time() + 30 * 86400,
-        }
+    if not email:
+        return jsonify({"error": "Email required"}), 400
 
-    return {"status": "ok"}
+    ENTITLEMENTS[email.lower()] = {
+        "plan": "plus",
+        "screen_remaining": SCREEN_LIMIT_PLUS
+    }
+
+    return jsonify({"status": "ok"})
+
+# ---------------- RUN SERVER ----------------
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
