@@ -1,66 +1,65 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
-import os
-import stripe
+import os, json, stripe
 
-# ---------------- APP SETUP ----------------
+# ================== SETUP ==================
 app = Flask(__name__)
 CORS(app)
 
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-client = OpenAI(api_key=OPENAI_KEY)
-stripe.api_key = STRIPE_SECRET_KEY
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# ---------------- HELPERS ----------------
-def get_user_email():
-    email = request.headers.get("X-User-Email")
-    return email.lower() if email else None
+ENTITLEMENT_FILE = "entitlements.json"
 
-def has_active_subscription(email):
-    customers = stripe.Customer.list(email=email, limit=1).data
-    if not customers:
-        return False
+# ================== HELPERS ==================
+def load_entitlements():
+    if not os.path.exists(ENTITLEMENT_FILE):
+        return {}
+    with open(ENTITLEMENT_FILE, "r") as f:
+        return json.load(f)
 
-    subs = stripe.Subscription.list(
-        customer=customers[0].id,
-        status="active",
-        limit=1
-    )
-    return len(subs.data) > 0
+def save_entitlements(data):
+    with open(ENTITLEMENT_FILE, "w") as f:
+        json.dump(data, f)
 
-# ---------------- ROUTES ----------------
-@app.route("/health", methods=["GET"])
+def has_plus(email):
+    ent = load_entitlements()
+    return ent.get(email.lower()) == "active"
+
+# ================== ROUTES ==================
+
+@app.route("/health")
 def health():
     return jsonify({"status": "ok"})
 
+# ---------- CHAT ----------
 @app.route("/chat", methods=["POST"])
 def chat():
-    data = request.json
-    message = data.get("message")
-
-    if not message:
+    msg = request.json.get("message")
+    if not msg:
         return jsonify({"error": "No message"}), 400
 
-    resp = client.chat.completions.create(
+    res = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You are a calm step-by-step assistant."},
-            {"role": "user", "content": message}
+            {"role": "user", "content": msg}
         ]
     )
 
-    return jsonify({"reply": resp.choices[0].message.content})
+    return jsonify({"reply": res.choices[0].message.content})
 
+# ---------- SCREEN SHARE ----------
 @app.route("/analyze_screen", methods=["POST"])
 def analyze_screen():
-    email = get_user_email()
+    email = request.headers.get("X-User-Email")
     if not email:
         return jsonify({"error": "Login required"}), 401
 
-    if not has_active_subscription(email):
+    if not has_plus(email):
         return jsonify({"error": "Upgrade to Plus to use screen share."}), 403
 
     data = request.json
@@ -68,25 +67,53 @@ def analyze_screen():
     image = data.get("image")
 
     if not prompt or not image:
-        return jsonify({"error": "Missing data"}), 400
+        return jsonify({"error": "Missing prompt or image"}), 400
 
-    resp = client.responses.create(
+    res = client.responses.create(
         model="gpt-4.1-mini",
         input=[{
             "role": "user",
             "content": [
                 {"type": "input_text", "text": prompt},
-                {
-                    "type": "input_image",
-                    "image_url": f"data:image/jpeg;base64,{image}"
-                }
+                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{image}"}
             ]
         }]
     )
 
-    return jsonify({"reply": resp.output_text})
+    return jsonify({"reply": res.output_text})
 
-# ---------------- RUN ----------------
+# ---------- STRIPE WEBHOOK ----------
+@app.route("/stripe/webhook", methods=["POST"])
+def stripe_webhook():
+    payload = request.data
+    sig = request.headers.get("Stripe-Signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig, STRIPE_WEBHOOK_SECRET
+        )
+    except Exception:
+        return "", 400
+
+    ent = load_entitlements()
+
+    if event["type"] in (
+        "customer.subscription.created",
+        "customer.subscription.updated",
+    ):
+        sub = event["data"]["object"]
+        email = sub["customer_email"]
+        if sub["status"] == "active":
+            ent[email.lower()] = "active"
+
+    if event["type"] == "customer.subscription.deleted":
+        sub = event["data"]["object"]
+        email = sub["customer_email"]
+        ent[email.lower()] = "canceled"
+
+    save_entitlements(ent)
+    return "", 200
+
+# ================== RUN ==================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
