@@ -7,11 +7,10 @@ import os, time
 app = Flask(__name__)
 CORS(app)
 
-# OpenAI client (same as original)
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
-# ---------------- TEMP ENTITLEMENTS (SAFE) ----------------
+# ---------------- TEMP ENTITLEMENTS ----------------
 ENTITLEMENTS = {}
 SCREEN_LIMIT_PLUS = 30
 
@@ -21,14 +20,15 @@ def get_user_email():
 
 def get_entitlement(email):
     return ENTITLEMENTS.get(email, {
-        "plan": "free",
+        "plan": "free",          # free | trial | plus
         "screen_remaining": 0
     })
 
 def ensure_plus_access(email):
     ent = get_entitlement(email)
 
-    if ent["plan"] != "plus":
+    # ✅ TRIAL COUNTS AS PLUS
+    if ent["plan"] not in ("plus", "trial"):
         return False, "Upgrade to Plus to use screen share."
 
     if ent["screen_remaining"] <= 0:
@@ -44,7 +44,7 @@ def ensure_plus_access(email):
 def health():
     return jsonify({"status": "ok"})
 
-# ---- CHAT (UNCHANGED BEHAVIOR) ----
+# ---- CHAT (UNCHANGED) ----
 @app.route("/chat", methods=["POST"])
 def chat():
     if not client:
@@ -56,29 +56,17 @@ def chat():
     if not user_message:
         return jsonify({"error": "No message provided"}), 400
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are Guardian, a calm step-by-step guide."
-                },
-                {
-                    "role": "user",
-                    "content": user_message
-                }
-            ]
-        )
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a calm step-by-step assistant."},
+            {"role": "user", "content": user_message}
+        ]
+    )
 
-        return jsonify({
-            "reply": response.choices[0].message.content
-        })
+    return jsonify({"reply": response.choices[0].message.content})
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ---- SCREEN ANALYSIS (PLUS ONLY) ----
+# ---- SCREEN SHARE (PLUS + TRIAL) ----
 @app.route("/analyze_screen", methods=["POST"])
 def analyze_screen():
     if not client:
@@ -93,49 +81,49 @@ def analyze_screen():
         return jsonify({"error": reason}), 403
 
     data = request.json
-    prompt = data.get("prompt") if data else None
-    image_b64 = data.get("image") if data else None
+    prompt = data.get("prompt")
+    image_b64 = data.get("image")
 
     if not prompt or not image_b64:
         return jsonify({"error": "Missing prompt or image"}), 400
 
-    try:
-        response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/jpeg;base64,{image_b64}"
-                    }
-                ]
-            }]
-        )
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/jpeg;base64,{image_b64}"
+                }
+            ]
+        }]
+    )
 
-        return jsonify({
-            "reply": response.output_text,
-            "remaining": ENTITLEMENTS[email]["screen_remaining"]
-        })
+    return jsonify({
+        "reply": response.output_text,
+        "remaining": ENTITLEMENTS[email]["screen_remaining"]
+    })
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ---- TEMP ADMIN (OPTIONAL, SAFE) ----
+# ---- ADMIN: GRANT PLUS ----
 @app.route("/_grant_plus", methods=["POST"])
 def grant_plus():
-    data = request.json
-    email = data.get("email") if data else None
-
-    if not email:
-        return jsonify({"error": "Email required"}), 400
-
+    email = request.json.get("email")
     ENTITLEMENTS[email.lower()] = {
         "plan": "plus",
         "screen_remaining": SCREEN_LIMIT_PLUS
     }
+    return jsonify({"status": "ok"})
 
+# ---- ADMIN: GRANT TRIAL ----
+@app.route("/_grant_trial", methods=["POST"])
+def grant_trial():
+    email = request.json.get("email")
+    ENTITLEMENTS[email.lower()] = {
+        "plan": "trial",
+        "screen_remaining": SCREEN_LIMIT_PLUS
+    }
     return jsonify({"status": "ok"})
 
 # ---------------- RUN SERVER ----------------
