@@ -90,12 +90,12 @@ def analyze_screen():
 
     return jsonify({"reply": res.output_text})
 
-# ---------- INSTANT UNLOCK (NEW) ----------
+# ---------- INSTANT UNLOCK ----------
 @app.route("/subscription/activate", methods=["POST"])
 def activate_subscription():
     """
     Called immediately after successful Stripe Checkout.
-    This is what removes the delay.
+    Works for BOTH paid subscriptions and free trials.
     """
     session_id = request.json.get("session_id")
     email = request.json.get("email")
@@ -106,9 +106,11 @@ def activate_subscription():
     try:
         session = stripe.checkout.Session.retrieve(session_id)
     except Exception as e:
+        print("Invalid session:", e)
         return jsonify({"error": "Invalid session"}), 400
 
-    if session.payment_status != "paid":
+    # ACCEPT PAID + TRIAL
+    if session.payment_status not in ("paid", "no_payment_required"):
         return jsonify({"error": "Payment not completed"}), 403
 
     ent = load_entitlements()
@@ -117,7 +119,7 @@ def activate_subscription():
 
     return jsonify({"status": "active"}), 200
 
-# ---------- STRIPE WEBHOOK (LOCK + SAFETY NET) ----------
+# ---------- STRIPE WEBHOOK (AUTHORITATIVE LOCK) ----------
 @app.route("/stripe/webhook", methods=["POST"])
 def stripe_webhook():
     payload = request.data
@@ -144,7 +146,7 @@ def stripe_webhook():
 
     email = email.lower()
 
-    # LOCK RULES (AUTHORITATIVE)
+    # LOCK CONDITIONS (FINAL AUTHORITY)
     if event_type in (
         "customer.subscription.updated",
         "customer.subscription.deleted",
