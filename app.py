@@ -1,22 +1,30 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
-import os, time, stripe
+import os
+import stripe
 
-# ---------------- APP SETUP ----------------
+# ===============================
+# APP SETUP
+# ===============================
 app = Flask(__name__)
 CORS(app)
 
-# OpenAI
+# ===============================
+# OPENAI
+# ===============================
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
-# Stripe
+# ===============================
+# STRIPE
+# ===============================
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# ---------------- TEMP ENTITLEMENTS ----------------
-# email -> { plan, screen_remaining }
+# ===============================
+# ENTITLEMENTS (TEMP / IN-MEMORY)
+# ===============================
 ENTITLEMENTS = {}
 SCREEN_LIMIT_PLUS = 30
 
@@ -33,7 +41,6 @@ def get_entitlement(email):
 def ensure_plus_access(email):
     ent = get_entitlement(email)
 
-    # trial counts as plus
     if ent["plan"] not in ("plus", "trial"):
         return False, "Upgrade to Plus to use screen share."
 
@@ -44,13 +51,17 @@ def ensure_plus_access(email):
     ENTITLEMENTS[email] = ent
     return True, None
 
-# ---------------- ROUTES ----------------
+# ===============================
+# ROUTES
+# ===============================
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
 
-# ---- CHAT (UNCHANGED) ----
+# -------------------------------
+# CHAT (FREE)
+# -------------------------------
 @app.route("/chat", methods=["POST"])
 def chat():
     if not client:
@@ -58,6 +69,7 @@ def chat():
 
     data = request.json
     user_message = data.get("message") if data else None
+
     if not user_message:
         return jsonify({"error": "No message provided"}), 400
 
@@ -71,7 +83,9 @@ def chat():
 
     return jsonify({"reply": response.choices[0].message.content})
 
-# ---- SCREEN SHARE (PLUS + TRIAL) ----
+# -------------------------------
+# SCREEN SHARE (PLUS / TRIAL)
+# -------------------------------
 @app.route("/analyze_screen", methods=["POST"])
 def analyze_screen():
     if not client:
@@ -111,52 +125,58 @@ def analyze_screen():
         "remaining": ENTITLEMENTS[email]["screen_remaining"]
     })
 
-# ---------------- STRIPE WEBHOOK ----------------
+# -------------------------------
+# STRIPE WEBHOOK (CRITICAL)
+# -------------------------------
 @app.route("/stripe/webhook", methods=["POST"])
 def stripe_webhook():
     payload = request.data
-    sig = request.headers.get("Stripe-Signature")
+    sig_header = request.headers.get("Stripe-Signature")
 
     try:
         event = stripe.Webhook.construct_event(
-            payload, sig, STRIPE_WEBHOOK_SECRET
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
         )
-    except Exception as e:
-        return str(e), 400
+    except Exception:
+        return "Invalid signature", 400
 
     event_type = event["type"]
-    data = event["data"]["object"]
+    obj = event["data"]["object"]
+    email = obj.get("customer_email")
 
-    # Get customer email
-    email = data.get("customer_email")
-    if email:
-        email = email.lower()
+    if not email:
+        return "No email", 200
 
-    # ---- TRIAL START / SUB CREATED ----
-    if event_type in ("checkout.session.completed", "customer.subscription.created"):
-        if email:
-            ENTITLEMENTS[email] = {
-                "plan": "trial" if data.get("status") == "trialing" else "plus",
-                "screen_remaining": SCREEN_LIMIT_PLUS
-            }
+    email = email.lower()
 
-    # ---- CANCEL / EXPIRE ----
+    # ✅ SUBSCRIPTION ACTIVE
     if event_type in (
-        "customer.subscription.deleted",
+        "customer.subscription.created",
         "customer.subscription.updated"
     ):
-        if email:
-            ENTITLEMENTS[email] = {
-                "plan": "free",
-                "screen_remaining": 0
-            }
+        ENTITLEMENTS[email] = {
+            "plan": "plus",
+            "screen_remaining": SCREEN_LIMIT_PLUS
+        }
 
-    return jsonify({"received": True})
+    # ❌ SUBSCRIPTION CANCELED
+    if event_type == "customer.subscription.deleted":
+        ENTITLEMENTS[email] = {
+            "plan": "free",
+            "screen_remaining": 0
+        }
 
-# ---------------- ADMIN (DEV ONLY) ----------------
+    return "ok", 200
+
+# -------------------------------
+# ADMIN (MANUAL OVERRIDES)
+# -------------------------------
 @app.route("/_grant_plus", methods=["POST"])
 def grant_plus():
     email = request.json.get("email")
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
     ENTITLEMENTS[email.lower()] = {
         "plan": "plus",
         "screen_remaining": SCREEN_LIMIT_PLUS
@@ -166,13 +186,18 @@ def grant_plus():
 @app.route("/_grant_trial", methods=["POST"])
 def grant_trial():
     email = request.json.get("email")
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
     ENTITLEMENTS[email.lower()] = {
         "plan": "trial",
         "screen_remaining": SCREEN_LIMIT_PLUS
     }
     return jsonify({"status": "ok"})
 
-# ---------------- RUN SERVER ----------------
+# ===============================
+# RUN
+# ===============================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
