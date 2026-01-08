@@ -10,27 +10,31 @@ CORS(app)
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
-# ---------------- IN-MEMORY ENTITLEMENTS ----------------
-# NOTE:
-# - This is TEMP
-# - Survives requests but NOT restarts
-# - Cancel does NOTHING (by design)
+# ---------------- TEMP ENTITLEMENTS (IN-MEMORY) ----------------
 ENTITLEMENTS = {}
-SCREEN_LIMIT_PLUS = 999999  # effectively unlimited
+SCREEN_LIMIT_PLUS = 30
 
 def get_user_email():
     email = request.headers.get("X-User-Email")
     return email.lower() if email else None
 
-def ensure_plus_access(email):
-    ent = ENTITLEMENTS.get(email)
+def get_entitlement(email):
+    return ENTITLEMENTS.get(email, {
+        "plan": "free",            # free | plus
+        "screen_remaining": 0
+    })
 
-    if not ent:
-        return False, "Upgrade to Plus to use screen share."
+def ensure_plus_access(email):
+    ent = get_entitlement(email)
 
     if ent["plan"] != "plus":
         return False, "Upgrade to Plus to use screen share."
 
+    if ent["screen_remaining"] <= 0:
+        return False, "Screen share limit reached."
+
+    ent["screen_remaining"] -= 1
+    ENTITLEMENTS[email] = ent
     return True, None
 
 # ---------------- ROUTES ----------------
@@ -39,29 +43,31 @@ def ensure_plus_access(email):
 def health():
     return jsonify({"status": "ok"})
 
-# -------- CHAT (ALWAYS FREE) --------
+# ---------------- CHAT (FREE) ----------------
 @app.route("/chat", methods=["POST"])
 def chat():
     if not client:
         return jsonify({"error": "OpenAI not configured"}), 500
 
     data = request.json
-    user_message = data.get("message") if data else None
+    message = data.get("message") if data else None
 
-    if not user_message:
+    if not message:
         return jsonify({"error": "No message provided"}), 400
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You are a calm step-by-step assistant."},
-            {"role": "user", "content": user_message}
+            {"role": "user", "content": message}
         ]
     )
 
-    return jsonify({"reply": response.choices[0].message.content})
+    return jsonify({
+        "reply": response.choices[0].message.content
+    })
 
-# -------- SCREEN SHARE (PLUS ONLY) --------
+# ---------------- SCREEN SHARE (PLUS ONLY) ----------------
 @app.route("/analyze_screen", methods=["POST"])
 def analyze_screen():
     if not client:
@@ -96,19 +102,23 @@ def analyze_screen():
         }]
     )
 
-    return jsonify({"reply": response.output_text})
+    return jsonify({
+        "reply": response.output_text,
+        "remaining": ENTITLEMENTS[email]["screen_remaining"]
+    })
 
-# -------- MANUAL GRANT (WHAT MADE IT WORK) --------
+# ---------------- ADMIN (TESTING ONLY) ----------------
 @app.route("/_grant_plus", methods=["POST"])
 def grant_plus():
     data = request.json
-    email = data.get("email")
+    email = data.get("email") if data else None
 
     if not email:
-        return jsonify({"error": "email required"}), 400
+        return jsonify({"error": "Email required"}), 400
 
     ENTITLEMENTS[email.lower()] = {
-        "plan": "plus"
+        "plan": "plus",
+        "screen_remaining": SCREEN_LIMIT_PLUS
     }
 
     return jsonify({"status": "ok"})
