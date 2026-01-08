@@ -29,6 +29,14 @@ def has_plus(email):
     ent = load_entitlements()
     return ent.get(email.lower()) == "active"
 
+def get_customer_email(customer_id):
+    try:
+        customer = stripe.Customer.retrieve(customer_id)
+        return customer.email
+    except Exception as e:
+        print("Failed to fetch customer email:", e)
+        return None
+
 # ================== ROUTES ==================
 
 @app.route("/health")
@@ -92,24 +100,39 @@ def stripe_webhook():
         event = stripe.Webhook.construct_event(
             payload, sig, STRIPE_WEBHOOK_SECRET
         )
-    except Exception:
+    except Exception as e:
+        print("Webhook verification failed:", e)
         return "", 400
 
     ent = load_entitlements()
+    obj = event["data"]["object"]
+    event_type = event["type"]
 
-    if event["type"] in (
+    if "customer" not in obj:
+        return "", 200
+
+    email = get_customer_email(obj["customer"])
+    if not email:
+        return "", 200
+
+    email = email.lower()
+
+    # INSTANT LOCK RULE:
+    # - canceled
+    # - unpaid
+    # - incomplete
+    # - cancel_at_period_end = True
+    if event_type in (
         "customer.subscription.created",
         "customer.subscription.updated",
     ):
-        sub = event["data"]["object"]
-        email = sub["customer_email"]
-        if sub["status"] == "active":
-            ent[email.lower()] = "active"
+        if obj["status"] == "active" and not obj.get("cancel_at_period_end", False):
+            ent[email] = "active"
+        else:
+            ent[email] = "canceled"
 
-    if event["type"] == "customer.subscription.deleted":
-        sub = event["data"]["object"]
-        email = sub["customer_email"]
-        ent[email.lower()] = "canceled"
+    if event_type == "customer.subscription.deleted":
+        ent[email] = "canceled"
 
     save_entitlements(ent)
     return "", 200
