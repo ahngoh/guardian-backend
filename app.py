@@ -90,7 +90,34 @@ def analyze_screen():
 
     return jsonify({"reply": res.output_text})
 
-# ---------- STRIPE WEBHOOK ----------
+# ---------- INSTANT UNLOCK (NEW) ----------
+@app.route("/subscription/activate", methods=["POST"])
+def activate_subscription():
+    """
+    Called immediately after successful Stripe Checkout.
+    This is what removes the delay.
+    """
+    session_id = request.json.get("session_id")
+    email = request.json.get("email")
+
+    if not session_id or not email:
+        return jsonify({"error": "Missing session_id or email"}), 400
+
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except Exception as e:
+        return jsonify({"error": "Invalid session"}), 400
+
+    if session.payment_status != "paid":
+        return jsonify({"error": "Payment not completed"}), 403
+
+    ent = load_entitlements()
+    ent[email.lower()] = "active"
+    save_entitlements(ent)
+
+    return jsonify({"status": "active"}), 200
+
+# ---------- STRIPE WEBHOOK (LOCK + SAFETY NET) ----------
 @app.route("/stripe/webhook", methods=["POST"])
 def stripe_webhook():
     payload = request.data
@@ -117,22 +144,13 @@ def stripe_webhook():
 
     email = email.lower()
 
-    # INSTANT LOCK RULE:
-    # - canceled
-    # - unpaid
-    # - incomplete
-    # - cancel_at_period_end = True
+    # LOCK RULES (AUTHORITATIVE)
     if event_type in (
-        "customer.subscription.created",
         "customer.subscription.updated",
+        "customer.subscription.deleted",
     ):
-        if obj["status"] == "active" and not obj.get("cancel_at_period_end", False):
-            ent[email] = "active"
-        else:
+        if obj.get("status") != "active" or obj.get("cancel_at_period_end", False):
             ent[email] = "canceled"
-
-    if event_type == "customer.subscription.deleted":
-        ent[email] = "canceled"
 
     save_entitlements(ent)
     return "", 200
