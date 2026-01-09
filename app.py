@@ -1,44 +1,34 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
-import os, json, stripe
+import os, stripe
 
 # ================== SETUP ==================
 app = Flask(__name__)
 CORS(app)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
-ENTITLEMENT_FILE = "entitlements.json"
+# ================== STRIPE HELPERS ==================
+def has_active_subscription(email: str) -> bool:
+    try:
+        customers = stripe.Customer.list(email=email, limit=1)
+        if not customers.data:
+            return False
 
-# ================== HELPERS ==================
-def load_entitlements():
-    if not os.path.exists(ENTITLEMENT_FILE):
-        return {}
-    with open(ENTITLEMENT_FILE, "r") as f:
-        return json.load(f)
+        customer = customers.data[0]
+        subs = stripe.Subscription.list(customer=customer.id, limit=10)
 
-def save_entitlements(data):
-    with open(ENTITLEMENT_FILE, "w") as f:
-        json.dump(data, f)
+        for sub in subs.data:
+            if sub.status in ("active", "trialing"):
+                return True
 
-def get_customer_by_email(email):
-    customers = stripe.Customer.list(email=email, limit=1)
-    return customers.data[0] if customers.data else None
-
-def has_active_subscription(email):
-    customer = get_customer_by_email(email)
-    if not customer:
         return False
 
-    subs = stripe.Subscription.list(customer=customer.id, limit=10)
-    for sub in subs.data:
-        if sub.status in ("active", "trialing"):
-            return True
-
-    return False
+    except Exception as e:
+        print("Stripe check failed:", e)
+        return False
 
 # ================== ROUTES ==================
 
@@ -63,23 +53,25 @@ def chat():
 
     return jsonify({"reply": res.choices[0].message.content})
 
-# ---------- SCREEN SHARE (LIVE STRIPE CHECK) ----------
+# ---------- ENTITLEMENT CHECK ----------
+@app.route("/entitlement/check", methods=["GET"])
+def entitlement_check():
+    email = request.headers.get("X-User-Email")
+    if not email:
+        return jsonify({"allowed": False}), 401
+
+    allowed = has_active_subscription(email.lower())
+    return jsonify({"allowed": allowed}), (200 if allowed else 403)
+
+# ---------- SCREEN SHARE ----------
 @app.route("/analyze_screen", methods=["POST"])
 def analyze_screen():
     email = request.headers.get("X-User-Email")
     if not email:
         return jsonify({"error": "Login required"}), 401
 
-    email = email.lower()
-
-    # 🔥 LIVE STRIPE CHECK (SOURCE OF TRUTH)
-    if not has_active_subscription(email):
+    if not has_active_subscription(email.lower()):
         return jsonify({"error": "Upgrade to Plus to use screen share."}), 403
-
-    # Cache entitlement for performance (optional)
-    ent = load_entitlements()
-    ent[email] = "active"
-    save_entitlements(ent)
 
     data = request.json
     prompt = data.get("prompt")
